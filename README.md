@@ -86,8 +86,8 @@ project/
 ### 1. Compile
 
 ```bash
-gcc server.c -o server -lpthread
-gcc client.c -o client -lpthread
+gcc server_with_roles_final.c -o server -lpthread
+gcc client_f.c -o client -lpthread
 ```
 
 ### 2. Run Server
