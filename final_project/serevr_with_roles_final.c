@@ -5,6 +5,8 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <fcntl.h>
 
 #define PORT 8080
 #define MAX_CLIENTS 10
@@ -20,10 +22,13 @@ int live_count = 0;
 int edit_queue[MAX_QUEUE];
 int queue_count = 0;
 
-int is_editing = 0;
 int current_editor = -1;
+int is_editing = 0;
 
 int version_number = 1;
+
+// IPC
+int pipe_fd[2];
 
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t file_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -35,66 +40,24 @@ int exists(int arr[], int size, int val) {
     return 0;
 }
 
-// ===== get role =====
-char* get_role(int sock) {
-    for (int i = 0; i < client_count; i++)
-        if (client_sockets[i] == sock)
-            return roles[i];
-    return "editor";
+// ===== IPC =====
+void* pipe_reader(void* arg) {
+    char buffer[256];
+    while (1) {
+        int n = read(pipe_fd[0], buffer, sizeof(buffer)-1);
+        if (n > 0) {
+            buffer[n] = '\0';
+            printf("[IPC LOG]: %s", buffer);
+        }
+    }
 }
 
 // ===== broadcast =====
 void broadcast(char* msg, int sender) {
     pthread_mutex_lock(&lock);
-    for (int i = 0; i < client_count; i++)
+    for (int i = 0; i < client_count; i++) {
         if (client_sockets[i] != sender)
             send(client_sockets[i], msg, strlen(msg), 0);
-    pthread_mutex_unlock(&lock);
-}
-
-// ===== live update =====
-void send_live_update() {
-    FILE *fp = fopen("shared.txt", "r");
-    if (!fp) return;
-
-    char content[4096] = {0}, line[256];
-    while (fgets(line, sizeof(line), fp))
-        strcat(content, line);
-
-    fclose(fp);
-
-    pthread_mutex_lock(&lock);
-    for (int i = 0; i < live_count; i++)
-        send(live_clients[i], content, strlen(content), 0);
-    pthread_mutex_unlock(&lock);
-}
-
-// ===== remove client =====
-void remove_client(int sock) {
-    pthread_mutex_lock(&lock);
-    for (int i = 0; i < client_count; i++) {
-        if (client_sockets[i] == sock) {
-            for (int j = i; j < client_count - 1; j++) {
-                client_sockets[j] = client_sockets[j + 1];
-                strcpy(roles[j], roles[j + 1]);
-            }
-            client_count--;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&lock);
-}
-
-// ===== remove live =====
-void remove_live_client(int sock) {
-    pthread_mutex_lock(&lock);
-    for (int i = 0; i < live_count; i++) {
-        if (live_clients[i] == sock) {
-            for (int j = i; j < live_count - 1; j++)
-                live_clients[j] = live_clients[j + 1];
-            live_count--;
-            break;
-        }
     }
     pthread_mutex_unlock(&lock);
 }
@@ -106,13 +69,35 @@ void read_file(char *filename, char *buffer) {
 
     char line[256];
     while (fgets(line, sizeof(line), fp))
-        strcat(buffer, line);
+        strncat(buffer, line, 4096 - strlen(buffer) - 1);
 
     fclose(fp);
 }
 
-// ===== client =====
+// ===== live update =====
+void send_live_update() {
+    char content[4096] = {0};
+    read_file("shared.txt", content);
+
+    for (int i = 0; i < live_count; i++)
+        send(live_clients[i], content, strlen(content), 0);
+}
+
+// ===== remove live =====
+void remove_live_client(int sock) {
+    for (int i = 0; i < live_count; i++) {
+        if (live_clients[i] == sock) {
+            for (int j = i; j < live_count - 1; j++)
+                live_clients[j] = live_clients[j + 1];
+            live_count--;
+            break;
+        }
+    }
+}
+
+// ===== client handler =====
 void* handle_client(void* arg) {
+
     int sock = *(int*)arg;
     free(arg);
 
@@ -125,14 +110,11 @@ void* handle_client(void* arg) {
     pthread_mutex_lock(&lock);
     int index = client_count - 1;
 
-    // ===== ROLE + PASSWORD =====
+    // ===== ROLE =====
     if (strcmp(name, "admin") == 0) {
-        char password[50] = {0};
-
+        char password[50];
         send(sock, "Enter admin password:\n", 23, 0);
-        int p = read(sock, password, sizeof(password)-1);
-
-        if (p > 0) password[p] = '\0';
+        read(sock, password, sizeof(password));
         password[strcspn(password, "\n")] = 0;
 
         if (strcmp(password, "admin1234") == 0) {
@@ -140,7 +122,6 @@ void* handle_client(void* arg) {
             send(sock, "Admin access granted\n", 21, 0);
         } else {
             strcpy(roles[index], "editor");
-            send(sock, "Wrong password → editor mode\n", 32, 0);
         }
     } else {
         strcpy(roles[index], "editor");
@@ -156,7 +137,7 @@ void* handle_client(void* arg) {
         buffer[n] = '\0';
         buffer[strcspn(buffer, "\n")] = 0;
 
-        char *role = get_role(sock);
+        char *role = (strcmp(name, "admin") == 0) ? "admin" : "editor";
 
         // ===== VIEW =====
         if (strcmp(buffer, "view") == 0) {
@@ -169,6 +150,7 @@ void* handle_client(void* arg) {
         else if (strcmp(buffer, "live") == 0) {
             if (!exists(live_clients, live_count, sock))
                 live_clients[live_count++] = sock;
+
             send(sock, "LIVE MODE\n", 10, 0);
         }
 
@@ -182,10 +164,16 @@ void* handle_client(void* arg) {
 
             pthread_mutex_lock(&file_lock);
 
+            if (queue_count >= MAX_QUEUE) {
+                send(sock, "Queue full\n", 11, 0);
+                pthread_mutex_unlock(&file_lock);
+                continue;
+            }
+
             if (!exists(edit_queue, queue_count, sock))
                 edit_queue[queue_count++] = sock;
 
-            if (!is_editing && queue_count > 0) {
+            if (!is_editing) {
                 current_editor = edit_queue[0];
 
                 for (int i = 1; i < queue_count; i++)
@@ -202,7 +190,7 @@ void* handle_client(void* arg) {
             pthread_mutex_unlock(&file_lock);
         }
 
-        // ===== FORCE EDIT (FIXED) =====
+        // ===== FORCE EDIT =====
         else if (strcmp(buffer, "force_edit") == 0) {
 
             if (strcmp(role, "admin") != 0) {
@@ -212,11 +200,8 @@ void* handle_client(void* arg) {
 
             pthread_mutex_lock(&file_lock);
 
-            // 🔥 push interrupted editor to FRONT
             if (is_editing && current_editor != -1) {
-
                 if (!exists(edit_queue, queue_count, current_editor)) {
-
                     for (int i = queue_count; i > 0; i--)
                         edit_queue[i] = edit_queue[i - 1];
 
@@ -262,27 +247,34 @@ void* handle_client(void* arg) {
 
             pthread_mutex_unlock(&file_lock);
 
-            FILE *fp = fopen("shared.txt", "a");
-            if (fp) {
-                fprintf(fp, "[%s]: %s\n", name, content);
-                fclose(fp);
-            }
+            // FILE LOCK
+            int fd = open("shared.txt", O_WRONLY | O_APPEND);
+            flock(fd, LOCK_EX);
 
-            // ===== VERSION SAVE =====
+            FILE *fp = fdopen(fd, "a");
+            fprintf(fp, "[%s]: %s\n", name, content);
+            fflush(fp);
+
+            flock(fd, LOCK_UN);
+            fclose(fp);
+
+            // VERSION SAVE
             char fname[50];
             sprintf(fname, "versions/v%d.txt", version_number++);
 
-            FILE *main_fp = fopen("shared.txt", "r");
-            FILE *vfp = fopen(fname, "w");
+            char temp[4096] = {0};
+            read_file("shared.txt", temp);
 
-            if (main_fp && vfp) {
-                char line[256];
-                while (fgets(line, sizeof(line), main_fp))
-                    fputs(line, vfp);
+            FILE *vfp = fopen(fname, "w");
+            if (vfp) {
+                fputs(temp, vfp);
+                fclose(vfp);
             }
 
-            if (main_fp) fclose(main_fp);
-            if (vfp) fclose(vfp);
+            // IPC LOG
+            char log_msg[256];
+            sprintf(log_msg, "Edited by %s\n", name);
+            write(pipe_fd[1], log_msg, strlen(log_msg));
 
             send_live_update();
 
@@ -298,8 +290,8 @@ void* handle_client(void* arg) {
 
                 send(current_editor, "You can edit now\n", 18, 0);
             } else {
-                is_editing = 0;
                 current_editor = -1;
+                is_editing = 0;
             }
 
             pthread_mutex_unlock(&file_lock);
@@ -310,11 +302,13 @@ void* handle_client(void* arg) {
         // ===== HISTORY =====
         else if (strcmp(buffer, "history") == 0) {
             char result[1024] = "Versions:\n";
+
             for (int i = 1; i < version_number; i++) {
                 char temp[50];
                 sprintf(temp, "v%d.txt\n", i);
                 strcat(result, temp);
             }
+
             send(sock, result, strlen(result), 0);
         }
 
@@ -325,8 +319,9 @@ void* handle_client(void* arg) {
             char fname[50];
             sprintf(fname, "versions/v%d.txt", num);
 
-            char content[2048] = {0};
+            char content[4096] = {0};
             read_file(fname, content);
+
             send(sock, content, strlen(content), 0);
         }
 
@@ -357,13 +352,10 @@ void* handle_client(void* arg) {
         else {
             char msg[1100];
             sprintf(msg, "[%s]: %s\n", name, buffer);
-            printf("%s", msg);
             broadcast(msg, sock);
         }
     }
 
-    printf("%s disconnected\n", name);
-    remove_client(sock);
     close(sock);
     return NULL;
 }
@@ -372,6 +364,10 @@ void* handle_client(void* arg) {
 int main() {
 
     mkdir("versions", 0777);
+
+    pipe(pipe_fd);
+    pthread_t pipe_thread;
+    pthread_create(&pipe_thread, NULL, pipe_reader, NULL);
 
     int server_fd;
     struct sockaddr_in addr;
